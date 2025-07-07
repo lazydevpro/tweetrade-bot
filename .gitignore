@@ -1,0 +1,10 @@
+node_modules
+.env
+llm_logs
+
+# Logs
+*.log
+
+# macOS system files
+.DS_Store
+

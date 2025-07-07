@@ -1,0 +1,15 @@
+{
+  "ignore": [
+    "*.log",
+    "*.json",
+    "llm_logs/*",
+    "combined.log",
+    "error.log",
+    "last_processed_state.json",
+    "mock_mentions.json",
+    "user_wallet_map.json"
+  ],
+  "watch": [
+    "src"
+  ]
+} 
