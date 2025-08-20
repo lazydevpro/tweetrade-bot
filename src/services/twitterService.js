@@ -6,16 +6,6 @@ const { getWalletForUser, getWalletByUsername, getOrCreateWalletForUser } = requ
 
 const logger = setupLogger();
 
-/**
- * @file twitterService.js
- * @description Handles Twitter API interactions, including fetching mentions and user info for the bot.
- */
-
-/**
- * TwitterService provides methods to interact with the Twitter API for mentions and user information.
- * @class
- */
-
 class TwitterService {
   constructor() {
     if (!process.env.TWITTER_API_KEY || !process.env.TWITTER_API_SECRET || !process.env.TWITTER_ACCESS_TOKEN || !process.env.TWITTER_ACCESS_SECRET) {
@@ -45,11 +35,6 @@ class TwitterService {
     });
   }
 
-  /**
-   * Fetches recent mentions of the bot from Twitter.
-   * @param {string|null} sinceTimestamp - Optional timestamp to fetch mentions since.
-   * @returns {Promise<Array<object>>} Array of tweet objects.
-   */
   async getMentions(sinceTimestamp = null) {
     // If MOCK_TWITTER is set, load from mock_mentions.json
     if (process.env.MOCK_TWITTER === '1') {
@@ -138,11 +123,6 @@ class TwitterService {
     }
   }
 
-  /**
-   * Fetches user info by Twitter user ID.
-   * @param {string} userId - Twitter user ID.
-   * @returns {Promise<{id: string, username: string, name?: string}|null>} User info or null.
-   */
   async getUserInfo(userId) {
     console.log('getUserInfo', userId);
     // First try to get from DB
@@ -152,6 +132,7 @@ class TwitterService {
     } catch (err) {
       logger.error('Error fetching wallet from DB in getUserInfo', { userId, error: err.message, stack: err.stack });
     }
+    console.log('walletDoc', walletDoc);
     if (walletDoc && walletDoc.address && walletDoc.username) {
       return { id: userId, username: walletDoc.username };
     }
@@ -197,11 +178,6 @@ class TwitterService {
     }
   }
 
-  /**
-   * Fetches user info by Twitter username.
-   * @param {string} username - Twitter username.
-   * @returns {Promise<{id: string, username: string, name?: string}|null>} User info or null.
-   */
   async getUserInfoByUsername(username) {
     // First try to get from DB
     let walletDoc;
@@ -230,6 +206,106 @@ class TwitterService {
     } catch (error) {
       logger.error('Error fetching user info by username', {
         username,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async getTweet(tweetId) {
+    try {
+      const response = await this.client.v2.singleTweet(tweetId, {
+        'tweet.fields': ['author_id', 'created_at', 'text', 'public_metrics'],
+        'user.fields': ['username']
+      });
+      
+      if (response.data) {
+        logger.info('Tweet fetched successfully', { tweetId });
+        return response.data;
+      }
+      
+      return null;
+    } catch (error) {
+      logger.error('Error fetching tweet', {
+        tweetId,
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  async getTweetReplies(tweetId) {
+    try {
+      // Search for replies to the specific tweet
+      // Exclude bot and retweets via query; author exclusion will be applied post-fetch because we need the author id
+      const searchQuery = `conversation_id:${tweetId} -from:${this.username} -is:retweet`;
+      
+      const response = await this.client.v2.search(searchQuery, {
+        'tweet.fields': ['author_id', 'created_at', 'text', 'conversation_id', 'referenced_tweets'],
+        'user.fields': ['username'],
+        expansions: ['author_id'],
+        max_results: 100 // Twitter API limit
+      });
+      
+      if (response.data && response.data.data) {
+        const tweets = response.data.data;
+        const users = response.data.includes?.users || [];
+        
+        // Map user info to tweets
+        let repliesWithUserInfo = tweets.map(tweet => {
+          const user = users.find(u => u.id === tweet.author_id);
+          return {
+            ...tweet,
+            username: user ? user.username : null
+          };
+        });
+
+        // Filter out bot account and dedupe authors here too for defense-in-depth
+        const botUserId = this.userId || null;
+        if (botUserId) {
+          repliesWithUserInfo = repliesWithUserInfo.filter(t => t.author_id !== botUserId);
+        }
+        // Dedupe by author_id, keep first occurrence
+        const seen = new Set();
+        repliesWithUserInfo = repliesWithUserInfo.filter(t => {
+          if (seen.has(t.author_id)) return false;
+          seen.add(t.author_id);
+          return true;
+        });
+        
+        logger.info('Tweet replies fetched successfully', { 
+          tweetId, 
+          repliesCount: repliesWithUserInfo.length 
+        });
+        
+        return repliesWithUserInfo;
+      }
+      
+      logger.info('No replies found for tweet', { tweetId });
+      return [];
+      
+    } catch (error) {
+      logger.error('Error fetching tweet replies', {
+        tweetId,
+        error: error.message
+      });
+      return [];
+    }
+  }
+
+  async createTweet(text) {
+    try {
+      const response = await this.client.v2.tweet(text);
+      
+      if (response.data) {
+        logger.info('Tweet created successfully', { tweetId: response.data.id });
+        return response;
+      }
+      
+      return null;
+    } catch (error) {
+      logger.error('Error creating tweet', {
+        text: text.substring(0, 100) + '...',
         error: error.message
       });
       return null;

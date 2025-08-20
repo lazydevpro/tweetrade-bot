@@ -1,10 +1,5 @@
 const winston = require('winston');
 
-/**
- * @file logger.js
- * @description Sets up and exports a Winston logger for application-wide logging.
- */
-
 function setupLogger() {
   return winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -20,14 +15,10 @@ function setupLogger() {
         ),
       }),
       new winston.transports.File({ filename: 'error.log', level: 'error' }),
+      new winston.transports.File({ filename: 'combined.log' }),
     ],
   });
 }
-
-/**
- * Creates and configures a Winston logger instance.
- * @returns {import('winston').Logger} Winston logger instance.
- */
 
 module.exports = {
   setupLogger,
