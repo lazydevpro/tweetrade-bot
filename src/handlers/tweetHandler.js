@@ -6,6 +6,7 @@ const dexService = require('../services/dexService');
 const faucetService = require('../services/faucetService');
 const giveawayService = require('../services/giveawayService');
 const { XPService } = require('../services/xpService');
+const rewardService = require('../services/rewardService');
 const { ethers } = require('ethers');
 const { isValidEthereumAddress, parseRecipients } = require('../utils/addressValidator');
 
@@ -1283,6 +1284,214 @@ You can now send and receive tokens! Use commands like:
         } catch (error) {
           logger.error('Error handling XP history command:', error);
           const errorMessage = `@${authorUsername} Sorry, I couldn't retrieve your XP history. Please try again later.`;
+          await twitterService.replyToTweet(tweet.id, errorMessage);
+        }
+        break;
+      }
+
+      case 'claim_reward': {
+        try {
+          // Get user's wallet address
+          const walletInfo = await getOrCreateWalletForUser(tweet.author_id, authorUsername);
+          if (!walletInfo || !walletInfo.address) {
+            const noWalletMessage = `@${authorUsername} Please create a wallet first using 'create wallet' command.`;
+            await twitterService.replyToTweet(tweet.id, noWalletMessage);
+            break;
+          }
+
+          // Get period ID from params or use latest available
+          let periodId = command.params?.periodId;
+          if (periodId === undefined || periodId === null) {
+            // Get latest period with rewards
+            const claimableRewards = await rewardService.getClaimableRewards(tweet.author_id);
+            if (claimableRewards.length === 0) {
+              const noRewardsMessage = `@${authorUsername} You don't have any claimable rewards. Keep earning XP to qualify!`;
+              await twitterService.replyToTweet(tweet.id, noRewardsMessage);
+              break;
+            }
+            periodId = claimableRewards[0].periodId;
+          }
+
+          // Verify eligibility
+          const eligibility = await rewardService.verifyEligibility(tweet.author_id, periodId);
+          if (!eligibility.eligible) {
+            let errorMessage = `@${authorUsername} `;
+            if (eligibility.reason === 'User not in top N for this period') {
+              errorMessage += `You weren't in the top N for period ${periodId}.`;
+            } else if (eligibility.reason === 'Reward already claimed for this period') {
+              errorMessage += `You've already claimed rewards for period ${periodId}.`;
+            } else if (eligibility.reason === 'Pool does not exist for this period') {
+              const availablePeriods = await rewardService.getAvailablePeriods();
+              errorMessage += `No reward pool available for period ${periodId}. Available periods: ${availablePeriods.join(', ') || 'none'}`;
+            } else {
+              errorMessage += eligibility.reason || 'Unable to claim reward.';
+            }
+            await twitterService.replyToTweet(tweet.id, errorMessage);
+            break;
+          }
+
+          // Get nonce from contract
+          let nonce = 0;
+          try {
+            if (rewardService.contract) {
+              const currentNonce = await rewardService.contract.userPeriodNonces(walletInfo.address, periodId);
+              nonce = Number(currentNonce);
+            }
+          } catch (error) {
+            logger.warn('Could not get nonce from contract, using 0:', error);
+          }
+
+          // Prepare claim transaction
+          const claimData = await rewardService.prepareClaimTransaction(
+            periodId,
+            walletInfo.address,
+            eligibility.rank,
+            eligibility.rewardAmount,
+            nonce
+          );
+
+          // Format response with transaction data
+          const claimMessage = `@${authorUsername} 🎉 You're eligible to claim your reward!\n\n` +
+            `Period: ${periodId}\n` +
+            `Rank: #${eligibility.rank}\n` +
+            `Reward: ${ethers.formatEther(eligibility.rewardAmount)} METIS\n\n` +
+            `Contract: ${rewardService.contractAddress}\n` +
+            `To claim, call claimReward() with the signature provided.\n\n` +
+            `Signature: ${claimData.signature.substring(0, 20)}...`;
+
+          await twitterService.replyToTweet(tweet.id, claimMessage);
+
+          await addTweetReplyToHistory(tweet.author_id, {
+            tweetId: tweet.id,
+            tweetText: tweet.text,
+            replyId: null,
+            replyText: claimMessage,
+            createdAt: new Date(tweet.created_at),
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'claim_reward',
+            data: claimData
+          });
+
+        } catch (error) {
+          logger.error('Error handling claim reward command:', error);
+          let errorMessage = `@${authorUsername} `;
+          if (error.message.includes('Contract not initialized')) {
+            errorMessage += 'Reward system not available. Please try again later.';
+          } else if (error.message.includes('signature')) {
+            errorMessage += 'Error generating claim signature. Please try again.';
+          } else {
+            errorMessage += "Sorry, I couldn't process your claim request. Please try again later.";
+          }
+          await twitterService.replyToTweet(tweet.id, errorMessage);
+        }
+        break;
+      }
+
+      case 'check_rewards': {
+        try {
+          const claimableRewards = await rewardService.getClaimableRewards(tweet.author_id);
+          
+          if (claimableRewards.length === 0) {
+            const noRewardsMessage = `@${authorUsername} You don't have any claimable rewards. Keep earning XP to qualify!`;
+            await twitterService.replyToTweet(tweet.id, noRewardsMessage);
+            break;
+          }
+
+          let rewardsMessage = `@${authorUsername} 🎁 Your Claimable Rewards:\n\n`;
+          claimableRewards.forEach((reward, index) => {
+            rewardsMessage += `${index + 1}. Period ${reward.periodId} - Rank #${reward.rank} - ${ethers.formatEther(reward.rewardAmount)} METIS\n`;
+          });
+          rewardsMessage += `\nUse 'claim reward' to claim your rewards!`;
+
+          await twitterService.replyToTweet(tweet.id, rewardsMessage);
+
+          await addTweetReplyToHistory(tweet.author_id, {
+            tweetId: tweet.id,
+            tweetText: tweet.text,
+            replyId: null,
+            replyText: rewardsMessage,
+            createdAt: new Date(tweet.created_at),
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'check_rewards'
+          });
+
+        } catch (error) {
+          logger.error('Error handling check rewards command:', error);
+          const errorMessage = `@${authorUsername} Sorry, I couldn't retrieve your rewards. Please try again later.`;
+          await twitterService.replyToTweet(tweet.id, errorMessage);
+        }
+        break;
+      }
+
+      case 'available_periods': {
+        try {
+          const availablePeriods = await rewardService.getAvailablePeriods();
+          
+          if (availablePeriods.length === 0) {
+            const noPeriodsMessage = `@${authorUsername} No reward periods are currently available.`;
+            await twitterService.replyToTweet(tweet.id, noPeriodsMessage);
+            break;
+          }
+
+          const periodsMessage = `@${authorUsername} 📅 Available Reward Periods:\n\n` +
+            `Periods: ${availablePeriods.join(', ')}\n\n` +
+            `Use 'check rewards' to see if you have rewards to claim!`;
+
+          await twitterService.replyToTweet(tweet.id, periodsMessage);
+
+          await addTweetReplyToHistory(tweet.author_id, {
+            tweetId: tweet.id,
+            tweetText: tweet.text,
+            replyId: null,
+            replyText: periodsMessage,
+            createdAt: new Date(tweet.created_at),
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'available_periods'
+          });
+
+        } catch (error) {
+          logger.error('Error handling available periods command:', error);
+          const errorMessage = `@${authorUsername} Sorry, I couldn't retrieve available periods. Please try again later.`;
+          await twitterService.replyToTweet(tweet.id, errorMessage);
+        }
+        break;
+      }
+
+      case 'current_leaderboard': {
+        try {
+          const leaderboard = await xpService.getLeaderboard(10);
+          if (leaderboard.length === 0) {
+            const noDataMessage = `@${authorUsername} 🏆 No leaderboard data available yet. Be the first to earn XP!`;
+            await twitterService.replyToTweet(tweet.id, noDataMessage);
+            break;
+          }
+          
+          const currentPeriodId = await rewardService.getCurrentPeriodId();
+          let leaderboardMessage = `@${authorUsername} 🏆 Current Period (${currentPeriodId}) Leaderboard:\n\n`;
+          leaderboard.forEach((user, index) => {
+            const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`;
+            leaderboardMessage += `${medal} @${user.username} - ${user.totalXP.toLocaleString()} XP (${user.level})\n`;
+          });
+          
+          await twitterService.replyToTweet(tweet.id, leaderboardMessage);
+          
+          await addTweetReplyToHistory(tweet.author_id, {
+            tweetId: tweet.id,
+            tweetText: tweet.text,
+            replyId: null,
+            replyText: leaderboardMessage,
+            createdAt: new Date(tweet.created_at),
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'current_leaderboard'
+          });
+          
+        } catch (error) {
+          logger.error('Error handling current leaderboard command:', error);
+          const errorMessage = `@${authorUsername} Sorry, I couldn't retrieve the leaderboard. Please try again later.`;
           await twitterService.replyToTweet(tweet.id, errorMessage);
         }
         break;

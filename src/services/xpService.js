@@ -46,11 +46,30 @@ const DailyActivitySchema = new mongoose.Schema({
   dailyBonus: { type: Number, default: 0 }
 });
 
+// Period Reward Snapshot Schema - tracks period-based reward snapshots
+const PeriodRewardSnapshotSchema = new mongoose.Schema({
+  periodId: { type: Number, required: true, index: true }, // Period number (calculated from duration)
+  periodDuration: { type: Number, required: true }, // Duration in seconds (e.g., 604800 for 7 days)
+  periodStart: { type: Date, required: true }, // Period start timestamp
+  periodEnd: { type: Date, required: true }, // Period end timestamp
+  userId: { type: String, required: true, index: true },
+  username: { type: String, required: true },
+  rank: { type: Number, required: true },
+  totalXP: { type: Number, required: true },
+  rewardAmount: { type: String, required: true }, // Amount in wei/string format
+  tokenAddress: { type: String, required: true },
+  claimed: { type: Boolean, default: false },
+  claimedAt: { type: Date },
+  txHash: { type: String },
+  snapshotDate: { type: Date, default: Date.now }
+});
+
 // Create models
 const XPTransaction = mongoose.model('XPTransaction', XPTransactionSchema);
 const UserXP = mongoose.model('UserXP', UserXPSchema);
 const Leaderboard = mongoose.model('Leaderboard', LeaderboardSchema);
 const DailyActivity = mongoose.model('DailyActivity', DailyActivitySchema);
+const PeriodRewardSnapshot = mongoose.model('PeriodRewardSnapshot', PeriodRewardSnapshotSchema);
 
 // XP Reward Structure
 const XP_REWARDS = {
@@ -351,6 +370,20 @@ class XPService {
     }
   }
 
+  // Get top N users from leaderboard (for reward snapshots)
+  async getTopNUsers(topN) {
+    try {
+      const topUsers = await Leaderboard.find({})
+        .sort({ totalXP: -1, rank: 1 })
+        .limit(topN);
+
+      return topUsers;
+    } catch (error) {
+      logger.error('Error getting top N users:', error);
+      return [];
+    }
+  }
+
   // Get user's rank
   async getUserRank(userId) {
     try {
@@ -464,6 +497,7 @@ module.exports = {
   UserXP,
   Leaderboard,
   DailyActivity,
+  PeriodRewardSnapshot,
   XP_REWARDS,
   LEVEL_THRESHOLDS
 };

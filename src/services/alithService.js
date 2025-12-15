@@ -12,7 +12,7 @@ class AlithService {
       model: "gpt-4",
       preamble: `You are an AI assistant that understands user requests from tweets and translates them into a specific command format.
                 The command format is a JSON object with 'action' and 'params'.
-                'action' can be 'send', 'multi_send', 'send_to_address', 'balance', 'get_wallet_address', 'swap', 'swap_usdt_to_metis', 'greeting', 'create_wallet', 'drip', 'create_giveaway', 'xp', 'leaderboard', 'rank', or 'xp_history'.
+                'action' can be 'send', 'multi_send', 'send_to_address', 'balance', 'get_wallet_address', 'swap', 'swap_usdt_to_metis', 'greeting', 'create_wallet', 'drip', 'create_giveaway', 'xp', 'leaderboard', 'rank', 'xp_history', 'claim_reward', 'check_rewards', 'available_periods', or 'current_leaderboard'.
                 
                 For 'send', 'params' should include 'recipient', 'amount', and 'token'.
                 For 'multi_send', 'params' should include 'recipients' (array), 'amount', and 'token' (when sending to multiple recipients separated by commas).
@@ -25,6 +25,10 @@ class AlithService {
                 For 'create_wallet', 'params' should be empty (requests to create or show wallet).
                 For 'drip', 'params' should include 'address' (optional - if not provided, drip to user's own wallet).
                 For 'create_giveaway', 'params' should include 'tweetUrl', 'amount', 'token', 'winners', and 'duration' (e.g., "24h", "12h", "48h"). If no specific tweet URL is mentioned, use "this tweet" as the tweetUrl.
+                For 'claim_reward', 'params' should include 'periodId' (optional - if not provided, claim latest available reward).
+                For 'check_rewards', 'params' should be empty (check all claimable rewards).
+                For 'available_periods', 'params' should be empty (show available reward periods).
+                For 'current_leaderboard', 'params' should be empty (show current period's leaderboard).
                 
                 The user's request will be prepended with their twitter user ID.
                 
@@ -114,13 +118,31 @@ class AlithService {
                 Output: { "action": "xp_history", "params": {} }
                 
                 Tweet: "1455231687357390853 show my xp history"
-                Output: { "action": "xp_history", "params": {} }`,
+                Output: { "action": "xp_history", "params": {} }
+                
+                Tweet: "1455231687357390853 claim reward"
+                Output: { "action": "claim_reward", "params": {} }
+                
+                Tweet: "1455231687357390853 claim reward period 1"
+                Output: { "action": "claim_reward", "params": { "periodId": 1 } }
+                
+                Tweet: "1455231687357390853 check rewards"
+                Output: { "action": "check_rewards", "params": {} }
+                
+                Tweet: "1455231687357390853 what rewards can I claim?"
+                Output: { "action": "check_rewards", "params": {} }
+                
+                Tweet: "1455231687357390853 available periods"
+                Output: { "action": "available_periods", "params": {} }
+                
+                Tweet: "1455231687357390853 show current leaderboard"
+                Output: { "action": "current_leaderboard", "params": {} }`,
     });
 
     // A separate agent for conversational replies when no command is recognized
     this.chatAgent = new Agent({
       model: "gpt-4",
-      preamble: `You are a helpful assistant for a Twitter crypto bot. If the user's tweet does not map to a supported command, reply conversationally in under 240 characters. Be friendly, informative, and suggest how to phrase supported commands (like balance, send, swap, drip, create_wallet, create_giveaway). Never output JSON. Address the user if an @handle is provided in the prompt.`,
+      preamble: `You are a helpful assistant for a Twitter crypto bot. If the user's tweet does not map to a supported command, reply conversationally in under 240 characters. Be friendly, informative, and suggest how to phrase supported commands (like balance, send, swap, drip, create_wallet, create_giveaway, xp, claim reward, check rewards). Never output JSON. Address the user if an @handle is provided in the prompt.`,
     });
   }
 
