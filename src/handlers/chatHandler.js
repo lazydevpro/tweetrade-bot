@@ -12,6 +12,8 @@ const {
 } = require('../services/privyUserService');
 const { XPService } = require('../services/xpService');
 const { isValidEthereumAddress } = require('../utils/addressValidator');
+const { getRewardService } = require('../services/rewardService');
+const { ethers } = require('ethers');
 
 const logger = setupLogger();
 const xpService = new XPService();
@@ -83,6 +85,74 @@ async function handleChat({ message, twitterUserId, twitterUsername, tweetUrl })
     logger.info('Parsed chat command', { action: command.action, params: command.params });
 
     switch (command.action) {
+      case 'available_periods': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            return { status: 'error', action: 'available_periods', reply: `@${authorUsername} Rewards are not configured on this bot right now.` };
+          }
+          // We don't maintain an on-chain list yet; expose what the user can actually claim via snapshots+pool existence.
+          const claimable = await rewardService.getClaimableRewards(twitterUserId);
+          if (!claimable.length) {
+            return { status: 'success', action: 'available_periods', reply: `@${authorUsername} No claimable reward periods found right now.` };
+          }
+          const periods = [...new Set(claimable.map(r => r.periodId))].sort((a, b) => b - a);
+          return { status: 'success', action: 'available_periods', reply: `@${authorUsername} Claimable periods: ${periods.join(', ')}` };
+        } catch (error) {
+          logger.error('Error handling available_periods in chat:', error);
+          return { status: 'error', action: 'available_periods', reply: `@${authorUsername} Sorry, I couldn't fetch available periods. ${error.message}` };
+        }
+      }
+
+      case 'check_rewards': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            return { status: 'error', action: 'check_rewards', reply: `@${authorUsername} Rewards are not configured on this bot right now.` };
+          }
+          const claimable = await rewardService.getClaimableRewards(twitterUserId);
+          if (!claimable.length) {
+            return { status: 'success', action: 'check_rewards', reply: `@${authorUsername} You have no claimable rewards right now.` };
+          }
+          const lines = claimable
+            .sort((a, b) => b.periodId - a.periodId)
+            .slice(0, 10)
+            .map(r => `• Period ${r.periodId}: rank #${r.rank}, reward ${ethers.formatEther(r.rewardAmount)} METIS`);
+          return { status: 'success', action: 'check_rewards', reply: `@${authorUsername} Claimable rewards:\n${lines.join('\n')}` };
+        } catch (error) {
+          logger.error('Error handling check_rewards in chat:', error);
+          return { status: 'error', action: 'check_rewards', reply: `@${authorUsername} Sorry, I couldn't check rewards. ${error.message}` };
+        }
+      }
+
+      case 'claim_reward': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            return { status: 'error', action: 'claim_reward', reply: `@${authorUsername} Rewards are not configured on this bot right now.` };
+          }
+          const requestedPeriodId = command?.params?.periodId;
+          let periodId = requestedPeriodId !== undefined && requestedPeriodId !== null ? Number(requestedPeriodId) : null;
+
+          if (periodId === null || Number.isNaN(periodId)) {
+            // Claim most recent claimable
+            const claimable = await rewardService.getClaimableRewards(twitterUserId);
+            if (!claimable.length) {
+              return { status: 'success', action: 'claim_reward', reply: `@${authorUsername} You have no claimable rewards right now.` };
+            }
+            periodId = claimable.sort((a, b) => b.periodId - a.periodId)[0].periodId;
+          }
+
+          const result = await rewardService.claim(periodId, twitterUserId);
+          const explorer = process.env.BLOCK_EXPLORER_URL || '';
+          const txUrl = explorer ? `${explorer.replace(/\\/$/, '')}/tx/${result.txHash}` : result.txHash;
+          return { status: 'success', action: 'claim_reward', reply: `@${authorUsername} Claim submitted for period ${periodId}. TX: ${txUrl}`, data: { txHash: result.txHash, periodId } };
+        } catch (error) {
+          logger.error('Error handling claim_reward in chat:', error);
+          return { status: 'error', action: 'claim_reward', reply: `@${authorUsername} ${error.message}` };
+        }
+      }
+
       case 'greeting': {
         const reply = `Hi @${authorUsername}! How can I help you today?`;
         
@@ -1130,6 +1200,270 @@ Total: ${giveaway.totalPrizeAmount} ${token}`;
           logger.error('Error handling XP history command in chat:', error);
           const reply = `@${authorUsername} Sorry, I couldn't retrieve your XP history. Please try again later.`;
           return { status: 'error', action: 'xp_history', reply };
+        }
+      }
+
+      case 'buy': {
+        const { tokenAddress, metisAmount, usdAmount } = command.params;
+        const senderWallet = await getWalletForUser(twitterUserId);
+        if (!senderWallet) {
+          const reply = `@${authorUsername} You need a wallet to buy tokens.`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: 'wallet_not_found'
+          });
+          return { status: 'error', action: 'buy', reply };
+        }
+
+        try {
+          const gm2HyperionService = require('../services/gm2HyperionService');
+          let ethInWei;
+          
+          if (metisAmount) {
+            // Convert METIS amount to wei (18 decimals)
+            ethInWei = BigInt(Math.floor(parseFloat(metisAmount) * Math.pow(10, 18)));
+          } else if (usdAmount) {
+            // For USD amounts, we'd need price conversion - for now, use a simple conversion
+            // In production, you'd want to get real-time METIS price
+            const metisPrice = 50; // Placeholder price - should be fetched dynamically
+            const metisAmount = parseFloat(usdAmount) / metisPrice;
+            ethInWei = BigInt(Math.floor(metisAmount * Math.pow(10, 18)));
+          } else {
+            const reply = `@${authorUsername} Please specify either metisAmount or usdAmount.`;
+            const { addChatEntryToHistory } = require('../services/privyUserService');
+            await addChatEntryToHistory(twitterUserId, {
+              tweetId: fakeTweetId,
+              tweetText: message,
+              replyId: null,
+              replyText: reply,
+              createdAt,
+              repliedAt: new Date(),
+              status: 'error',
+              error: 'missing_amount'
+            });
+            return { status: 'error', action: 'buy', reply };
+          }
+
+          const result = await gm2HyperionService.buyWithEth({
+            walletId: senderWallet.id,
+            tokenAddress,
+            ethInWei: ethInWei.toString(),
+            slippageBps: 50,
+            twitterUserId,
+            username: authorUsername
+          });
+
+          const reply = `@${authorUsername} GM2 token purchase submitted! TX: ${result.hash}`;
+          
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'buy'
+          });
+          
+          return { status: 'success', action: 'buy', reply, data: { txHash: result.hash } };
+          
+        } catch (error) {
+          logger.error('Chat buy failed', { error: error.message });
+          const reply = `@${authorUsername} Buy failed. ${error.message}`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: error.message
+          });
+          return { status: 'error', action: 'buy', reply };
+        }
+      }
+
+      case 'sell': {
+        const { tokenAddress, tokenAmount } = command.params;
+        const senderWallet = await getWalletForUser(twitterUserId);
+        if (!senderWallet) {
+          const reply = `@${authorUsername} You need a wallet to sell tokens.`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: 'wallet_not_found'
+          });
+          return { status: 'error', action: 'sell', reply };
+        }
+
+        try {
+          const gm2HyperionService = require('../services/gm2HyperionService');
+          
+          // Get token decimals for proper amount conversion
+          const tokenDecimals = await gm2HyperionService.getTokenDecimals(tokenAddress);
+          
+          // Convert token amount to proper units
+          let amountInUnits;
+          if (tokenAmount === 'all') {
+            // Get current token balance
+            const { getTokenBalance } = require('../services/privyUserService');
+            const balance = await getTokenBalance(senderWallet.address, tokenAddress, tokenDecimals);
+            amountInUnits = BigInt(Math.floor(parseFloat(balance) * Math.pow(10, tokenDecimals)));
+          } else {
+            amountInUnits = BigInt(Math.floor(parseFloat(tokenAmount) * Math.pow(10, tokenDecimals)));
+          }
+
+          const result = await gm2HyperionService.sellTokensForEth({
+            walletId: senderWallet.id,
+            tokenAddress,
+            tokenAmountUnits: amountInUnits.toString(),
+            tokenDecimals,
+            slippageBps: 50,
+            twitterUserId,
+            username: authorUsername
+          });
+
+          const reply = `@${authorUsername} GM2 token sale submitted! TX: ${result.hash}`;
+          
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'sell'
+          });
+          
+          return { status: 'success', action: 'sell', reply, data: { txHash: result.hash } };
+          
+        } catch (error) {
+          logger.error('Chat sell failed', { error: error.message });
+          const reply = `@${authorUsername} Sell failed. ${error.message}`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: error.message
+          });
+          return { status: 'error', action: 'sell', reply };
+        }
+      }
+
+      case 'token_info': {
+        const { tokenAddress } = command.params;
+        try {
+          const gm2ApiService = require('../services/gm2ApiService');
+          const tokenDetail = await gm2ApiService.getTokenDetail(tokenAddress);
+          
+          const reply = `@${authorUsername} 📊 Token Info for ${tokenAddress}:\n\n` +
+            `Name: ${tokenDetail.tokenName || 'N/A'}\n` +
+            `Symbol: ${tokenDetail.tokenSymbol || 'N/A'}\n` +
+            `Price: $${tokenDetail.currentPrice ? parseFloat(tokenDetail.currentPrice).toFixed(8) : 'N/A'}\n` +
+            `Market Cap: $${tokenDetail.totalMarketCap ? (parseFloat(tokenDetail.totalMarketCap) / 1e6).toFixed(2) + 'M' : 'N/A'}\n` +
+            `Holders: ${tokenDetail.totalHolders || 'N/A'}\n` +
+            `Volume: $${tokenDetail.totalVolume ? parseFloat(tokenDetail.totalVolume).toFixed(4) : 'N/A'}`;
+          
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'token_info'
+          });
+          
+          return { status: 'success', action: 'token_info', reply, data: tokenDetail };
+          
+        } catch (error) {
+          logger.error('Chat token_info failed', { error: error.message });
+          const reply = `@${authorUsername} Failed to get token info. ${error.message}`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: error.message
+          });
+          return { status: 'error', action: 'token_info', reply };
+        }
+      }
+
+      case 'top_tokens': {
+        const { limit = 10 } = command.params;
+        try {
+          const gm2ApiService = require('../services/gm2ApiService');
+          const tokens = await gm2ApiService.listTokens({ limit, page: 1, sort: 'totalMarketCap:desc' });
+          
+          let reply = `@${authorUsername} 🏆 Top ${tokens.length} GM2 Tokens:\n\n`;
+          tokens.forEach((token, index) => {
+            const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`;
+            const marketCap = token.totalMarketCap ? (parseFloat(token.totalMarketCap) / 1e6).toFixed(2) + 'M' : 'N/A';
+            const price = token.currentPrice ? parseFloat(token.currentPrice).toFixed(8) : 'N/A';
+            reply += `${medal} ${token.tokenSymbol || 'N/A'} - $${price} (MC: $${marketCap})\n`;
+            reply += `   Contract: ${token.tokenAddress}\n\n`;
+          });
+          
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'success',
+            action: 'top_tokens'
+          });
+          
+          return { status: 'success', action: 'top_tokens', reply, data: tokens };
+          
+        } catch (error) {
+          logger.error('Chat top_tokens failed', { error: error.message });
+          const reply = `@${authorUsername} Failed to get top tokens. ${error.message}`;
+          const { addChatEntryToHistory } = require('../services/privyUserService');
+          await addChatEntryToHistory(twitterUserId, {
+            tweetId: fakeTweetId,
+            tweetText: message,
+            replyId: null,
+            replyText: reply,
+            createdAt,
+            repliedAt: new Date(),
+            status: 'error',
+            error: error.message
+          });
+          return { status: 'error', action: 'top_tokens', reply };
         }
       }
       

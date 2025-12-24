@@ -77,6 +77,8 @@ jest.mock('mongoose', () => {
       index: jest.fn()
     };
   };
+  // Provide Schema.Types for code that references mongoose.Schema.Types.Mixed
+  Schema.Types = { Mixed: {} };
   return {
     connect: jest.fn(),
     model: jest.fn(() => ({})),

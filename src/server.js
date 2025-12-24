@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 require('dotenv').config();
 const { getOrCreateWalletForUser, getTweetHistoryForUser } = require('./services/privyUserService');
 const cors = require('cors');
+const { getRewardService, getRewardServiceInitError } = require('./services/rewardService');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -10,6 +11,47 @@ const PORT = process.env.PORT || 3001;
 // Middleware to parse JSON bodies
 app.use(express.json());
 app.use(cors());
+
+function requireAdmin(req, res) {
+  const required = process.env.ADMIN_API_KEY;
+  if (!required) return true; // dev mode
+  const provided = req.headers['x-admin-api-key'];
+  if (provided && String(provided) === String(required)) return true;
+  res.status(401).json({ error: 'Unauthorized' });
+  return false;
+}
+
+// --- Admin: Snapshot status / manual run ---
+app.get('/api/admin/rewards/snapshot/status', async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    const rewardService = getRewardService();
+    if (!rewardService) {
+      return res.json({ enabled: false, note: 'RewardService disabled', error: getRewardServiceInitError() });
+    }
+    const status = await rewardService.getSnapshotStatus();
+    return res.json(status);
+  } catch (err) {
+    console.error('Error in /api/admin/rewards/snapshot/status:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/rewards/snapshot/run', async (req, res) => {
+  try {
+    if (!requireAdmin(req, res)) return;
+    const rewardService = getRewardService();
+    if (!rewardService) {
+      return res.status(400).json({ enabled: false, error: 'RewardService disabled', detail: getRewardServiceInitError() });
+    }
+    const runResult = await rewardService.snapshotIfNeeded();
+    const status = await rewardService.getSnapshotStatus();
+    return res.json({ status, runResult: runResult || null });
+  } catch (err) {
+    console.error('Error in /api/admin/rewards/snapshot/run:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // --- /api/wallet endpoint ---
 app.get('/api/wallet', async (req, res) => {
@@ -276,6 +318,57 @@ app.get('/api/xp/stats', async (req, res) => {
     return res.json(stats);
   } catch (err) {
     console.error('Error in /api/xp/stats:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- GM2 Portfolio Endpoints ---
+app.get('/api/portfolio/gm2', async (req, res) => {
+  try {
+    const twitterUserId = req.headers['x-twitter-user-id'];
+    if (!twitterUserId) {
+      return res.status(400).json({ error: 'Missing X-Twitter-User-Id header' });
+    }
+    const { SwapTransaction } = require('./services/swapTransactionService');
+    const gm2Api = require('./services/gm2ApiService');
+    const gm2Hyperion = require('./services/gm2HyperionService');
+    const { getWalletForUser, getTokenBalance } = require('./services/privyUserService');
+
+    const wallet = await getWalletForUser(twitterUserId);
+    if (!wallet || !wallet.address) {
+      return res.json({ tokens: [], address: null });
+    }
+
+    const txs = await SwapTransaction.find({ twitterUserId, protocol: 'GM2_BOND', tokenAddress: { $ne: null } }).lean();
+    const distinct = [...new Set(txs.map(t => t.tokenAddress))];
+
+    const results = [];
+    for (const tokenAddress of distinct) {
+      try {
+        const detail = await gm2Api.getTokenDetail(tokenAddress);
+        const token = detail?.data;
+        const decimals = await gm2Hyperion.getTokenDecimals(tokenAddress);
+        const balance = await getTokenBalance(wallet.address, tokenAddress, decimals);
+        const balanceNum = parseFloat(balance || '0');
+        const priceUsd = token ? parseFloat(token.currentPrice || '0') : 0;
+        const valueUsd = balanceNum * priceUsd;
+        results.push({
+          tokenAddress,
+          tokenName: token?.tokenName || null,
+          tokenSymbol: token?.tokenSymbol || null,
+          balance,
+          priceUsd,
+          valueUsd,
+          imageUrl: token?.thumbImageUrl || token?.imageUrl || null,
+        });
+      } catch (e) {
+        results.push({ tokenAddress, error: e.message });
+      }
+    }
+
+    return res.json({ address: wallet.address, tokens: results });
+  } catch (err) {
+    console.error('Error in /api/portfolio/gm2:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

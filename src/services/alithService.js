@@ -12,7 +12,7 @@ class AlithService {
       model: "gpt-4",
       preamble: `You are an AI assistant that understands user requests from tweets and translates them into a specific command format.
                 The command format is a JSON object with 'action' and 'params'.
-                'action' can be 'send', 'multi_send', 'send_to_address', 'balance', 'get_wallet_address', 'swap', 'swap_usdt_to_metis', 'greeting', 'create_wallet', 'drip', 'create_giveaway', 'xp', 'leaderboard', 'rank', or 'xp_history'.
+                'action' can be 'send', 'multi_send', 'send_to_address', 'balance', 'get_wallet_address', 'swap', 'swap_usdt_to_metis', 'greeting', 'create_wallet', 'drip', 'create_giveaway', 'xp', 'leaderboard', 'rank', 'xp_history', 'buy', 'sell', 'token_info', 'top_tokens', 'available_periods', 'check_rewards', 'claim_reward'.
                 
                 For 'send', 'params' should include 'recipient', 'amount', and 'token'.
                 For 'multi_send', 'params' should include 'recipients' (array), 'amount', and 'token' (when sending to multiple recipients separated by commas).
@@ -25,6 +25,13 @@ class AlithService {
                 For 'create_wallet', 'params' should be empty (requests to create or show wallet).
                 For 'drip', 'params' should include 'address' (optional - if not provided, drip to user's own wallet).
                 For 'create_giveaway', 'params' should include 'tweetUrl', 'amount', 'token', 'winners', and 'duration' (e.g., "24h", "12h", "48h"). If no specific tweet URL is mentioned, use "this tweet" as the tweetUrl.
+                For 'buy', params should include 'tokenAddress' and either 'metisAmount' (e.g., 0.01) or 'usdAmount' (e.g., 5). If user writes "$" or "USD", set 'usdAmount'.
+                For 'sell', params should include 'tokenAddress' and 'tokenAmount' in token units (not wei). Support keywords like 'all'.
+                For 'token_info', params should include 'tokenAddress'.
+                For 'top_tokens', params may include 'limit' (default 10).
+                For 'available_periods', params should be empty.
+                For 'check_rewards', params should be empty.
+                For 'claim_reward', params may include 'periodId' (number) or be empty to claim the latest available.
                 
                 The user's request will be prepended with their twitter user ID.
                 
@@ -114,7 +121,34 @@ class AlithService {
                 Output: { "action": "xp_history", "params": {} }
                 
                 Tweet: "1455231687357390853 show my xp history"
-                Output: { "action": "xp_history", "params": {} }`,
+                Output: { "action": "xp_history", "params": {} }
+                
+                Tweet: "1455231687357390853 buy 0x2e58... worth of 0.01 metis"
+                Output: { "action": "buy", "params": { "tokenAddress": "0x2e58...", "metisAmount": "0.01" } }
+                
+                Tweet: "1455231687357390853 buy 0x2e58... for $5"
+                Output: { "action": "buy", "params": { "tokenAddress": "0x2e58...", "usdAmount": "5" } }
+                
+                Tweet: "1455231687357390853 sell 100000 of 0x2e58..."
+                Output: { "action": "sell", "params": { "tokenAddress": "0x2e58...", "tokenAmount": "100000" } }
+                
+                Tweet: "1455231687357390853 token info 0x2e58..."
+                Output: { "action": "token_info", "params": { "tokenAddress": "0x2e58..." } }
+                
+                Tweet: "1455231687357390853 top tokens 12"
+                Output: { "action": "top_tokens", "params": { "limit": "12" } }
+                
+                Tweet: "1455231687357390853 top token on gm2"
+                Output: { "action": "top_tokens", "params": { "limit": 10 } }
+                
+                Tweet: "1455231687357390853 show me gm2 tokens"
+                Output: { "action": "top_tokens", "params": { "limit": 10 } }
+                
+                Tweet: "1455231687357390853 what are the best gm2 tokens"
+                Output: { "action": "top_tokens", "params": { "limit": 10 } }
+                
+                Tweet: "1455231687357390853 gm2 top tokens"
+                Output: { "action": "top_tokens", "params": { "limit": 10 } }`,
     });
 
     // A separate agent for conversational replies when no command is recognized
@@ -156,4 +190,4 @@ class AlithService {
   }
 }
 
-module.exports = new AlithService(); 
+module.exports = new AlithService();

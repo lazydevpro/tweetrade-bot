@@ -5,14 +5,40 @@ const { setupLogger } = require('./utils/logger');
 const { handleTweet } = require('./handlers/tweetHandler');
 const twitterService = require('./services/twitterService');
 const giveawayService = require('./services/giveawayService');
+const { getRewardService } = require('./services/rewardService');
 
 const logger = setupLogger();
+const rewardService = getRewardService();
 
 const STATE_FILE = path.join(__dirname, '..', 'last_processed_state.json');
 
 // Keep track of the last processed tweet's timestamp
 let lastProcessedTweetTimestamp = null;
 let processedTweetIds = new Set();
+
+// Concurrency guards to prevent overlapping runs that can cause double replies
+let isCheckingMentions = false;
+let isProcessingGiveaways = false;
+
+function toIntOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.floor(n);
+}
+
+function computeStartTimestamp({ mode, lookbackSeconds, sinceTime }) {
+  const now = Date.now();
+  const lb = Math.max(0, lookbackSeconds ?? 0);
+  if (mode === 'since') {
+    if (!sinceTime) return new Date(now - lb * 1000).toISOString();
+    const t = new Date(sinceTime);
+    if (Number.isNaN(t.getTime())) return new Date(now - lb * 1000).toISOString();
+    return t.toISOString();
+  }
+  // mode === 'fresh' or 'resume' default start is now - lookback
+  return new Date(now - lb * 1000).toISOString();
+}
 
 function loadState() {
   try {
@@ -46,7 +72,60 @@ function saveState() {
   }
 }
 
+function initializeMentionCursor() {
+  // Modes:
+  // - resume (default): use saved cursor if present; if missing, start "now - lookback"
+  // - fresh: ignore saved cursor and start "now - lookback" (prevents historical backfill)
+  // - since: start at BOT_MENTIONS_START_TIME (RFC3339) or "now - lookback"
+  const modeRaw = (process.env.BOT_MENTIONS_START_MODE || 'resume').toLowerCase();
+  const mode = (modeRaw === 'fresh' || modeRaw === 'since' || modeRaw === 'resume') ? modeRaw : 'resume';
+  const lookbackSeconds =
+    toIntOrNull(process.env.BOT_MENTIONS_LOOKBACK_SECONDS) ??
+    (mode === 'fresh' ? 30 : 0); // default: 30s lookback on fresh to avoid missing just-before-start mentions
+  const sinceTime = process.env.BOT_MENTIONS_START_TIME || null;
+
+  if (mode === 'fresh') {
+    processedTweetIds = new Set();
+    lastProcessedTweetTimestamp = computeStartTimestamp({ mode, lookbackSeconds, sinceTime: null });
+    logger.warn('BOT_MENTIONS_START_MODE=fresh: starting from cursor (no historical mentions before this time)', {
+      cursor: lastProcessedTweetTimestamp,
+      lookbackSeconds,
+    });
+    saveState();
+    return;
+  }
+
+  if (mode === 'since') {
+    processedTweetIds = new Set(processedTweetIds); // keep any loaded dedupe, but not required
+    lastProcessedTweetTimestamp = computeStartTimestamp({ mode, lookbackSeconds, sinceTime });
+    logger.info('BOT_MENTIONS_START_MODE=since: starting from cursor', {
+      cursor: lastProcessedTweetTimestamp,
+      lookbackSeconds,
+      sinceTime,
+    });
+    saveState();
+    return;
+  }
+
+  // resume
+  if (!lastProcessedTweetTimestamp) {
+    lastProcessedTweetTimestamp = computeStartTimestamp({ mode, lookbackSeconds, sinceTime: null });
+    logger.info('BOT_MENTIONS_START_MODE=resume with no saved state: starting from cursor', {
+      cursor: lastProcessedTweetTimestamp,
+      lookbackSeconds,
+    });
+    saveState();
+  } else {
+    logger.info('BOT_MENTIONS_START_MODE=resume: using saved cursor', { cursor: lastProcessedTweetTimestamp });
+  }
+}
+
 async function checkMentions() {
+  if (isCheckingMentions) {
+    logger.warn('checkMentions skipped: previous run still in progress');
+    return;
+  }
+  isCheckingMentions = true;
   try {
     const mentions = await twitterService.getMentions(lastProcessedTweetTimestamp);
 
@@ -82,10 +161,17 @@ async function checkMentions() {
     }
   } catch (error) {
     logger.error('Error checking mentions:', error);
+  } finally {
+    isCheckingMentions = false;
   }
 }
 
 async function processGiveaways() {
+  if (isProcessingGiveaways) {
+    logger.warn('processGiveaways skipped: previous run still in progress');
+    return;
+  }
+  isProcessingGiveaways = true;
   try {
     // Get all active giveaways that have ended
     const activeGiveaways = await giveawayService.getActiveGiveaways();
@@ -210,6 +296,8 @@ async function processGiveaways() {
     
   } catch (error) {
     logger.error('Error processing giveaways', { error: error.message });
+  } finally {
+    isProcessingGiveaways = false;
   }
 }
 
@@ -218,16 +306,57 @@ async function main() {
     logger.info('Starting Twitter bot...');
 
     loadState();
+    initializeMentionCursor();
 
     // Initial checks
     await checkMentions();
-    await processGiveaways();
+    if (process.env.BOT_DISABLE_GIVEAWAYS !== '1') {
+      await processGiveaways();
+    } else {
+      logger.info('BOT_DISABLE_GIVEAWAYS=1: skipping giveaways processing');
+    }
+    if (rewardService) {
+      try {
+        if (process.env.BOT_DISABLE_SNAPSHOTS !== '1') {
+          await rewardService.snapshotIfNeeded();
+        } else {
+          logger.info('BOT_DISABLE_SNAPSHOTS=1: skipping reward snapshots');
+        }
+      } catch (e) {
+        logger.error('Initial reward snapshot check failed', { error: e.message });
+      }
+    } else {
+      logger.info('RewardService disabled (missing reward env vars). Skipping snapshots.');
+    }
+
+    // One-shot mode for local smoke testing / ops.
+    if (process.env.BOT_RUN_ONCE === '1') {
+      logger.warn('BOT_RUN_ONCE=1: completed initial cycle; exiting without scheduling intervals');
+      // Force exit even if there are open handles (e.g., mongoose connections initialized by services).
+      setTimeout(() => process.exit(0), 0);
+      return;
+    }
 
     // Check for new mentions every 1.5 minute
     setInterval(checkMentions, 90 * 1000); // 1.5 minutes
 
     // Process giveaways every 5 minutes
-    setInterval(processGiveaways, 5 * 60 * 1000); // 5 minutes
+    if (process.env.BOT_DISABLE_GIVEAWAYS !== '1') {
+      setInterval(processGiveaways, 5 * 60 * 1000); // 5 minutes
+    }
+
+    // Snapshot XP rewards on a configurable interval
+    if (rewardService) {
+      if (process.env.BOT_DISABLE_SNAPSHOTS !== '1') {
+        setInterval(async () => {
+          try {
+            await rewardService.snapshotIfNeeded();
+          } catch (e) {
+            logger.error('Reward snapshot interval failed', { error: e.message });
+          }
+        }, rewardService.snapshotCheckIntervalSeconds * 1000);
+      }
+    }
 
     logger.info('Twitter bot is running and checking for mentions and processing giveaways');
   } catch (error) {
@@ -236,4 +365,8 @@ async function main() {
   }
 }
 
-main(); 
+if (require.main === module) {
+  main();
+}
+
+module.exports = { main };

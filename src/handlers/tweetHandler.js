@@ -8,6 +8,10 @@ const giveawayService = require('../services/giveawayService');
 const { XPService } = require('../services/xpService');
 const { ethers } = require('ethers');
 const { isValidEthereumAddress, parseRecipients } = require('../utils/addressValidator');
+const gm2ApiService = require('../services/gm2ApiService');
+const gm2HyperionService = require('../services/gm2HyperionService');
+const priceService = require('../services/priceService');
+const { getRewardService } = require('../services/rewardService');
 
 
 const logger = setupLogger();
@@ -69,7 +73,33 @@ async function handleTweet(tweet, processedTweetIds) {
     logger.info('Text for Alith:', { textForAlith });
 
     // Parse the command from the tweet using Alith
-    const command = await alithService.understand(textForAlith);
+    let command = await alithService.understand(textForAlith);
+    // Fallback lightweight parsing for GM2-specific intents if AI misses
+    if (!command) {
+      const lc = cleanedText.toLowerCase();
+      const addressMatch = cleanedText.match(/0x[a-fA-F0-9]{40}/);
+      if (lc.includes('buy') && addressMatch) {
+        const tokenAddress = addressMatch[0];
+        const usdMatch = cleanedText.match(/\$\s*(\d+(?:\.\d+)?)/);
+        const metisMatch = cleanedText.match(/(\d+(?:\.\d+)?)\s*(?:metis|tmetis)/i);
+        if (usdMatch) {
+          command = { action: 'buy', params: { tokenAddress, usdAmount: usdMatch[1] } };
+        } else if (metisMatch) {
+          command = { action: 'buy', params: { tokenAddress, metisAmount: metisMatch[1] } };
+        }
+      } else if (lc.includes('sell') && addressMatch) {
+        const tokenAddress = addressMatch[0];
+        const amountMatch = cleanedText.match(/sell\s+(all|\d+(?:\.\d+)?)/i);
+        if (amountMatch) {
+          command = { action: 'sell', params: { tokenAddress, tokenAmount: amountMatch[1] } };
+        }
+      } else if ((lc.includes('token info') || lc.startsWith('info ')) && addressMatch) {
+        command = { action: 'token_info', params: { tokenAddress: addressMatch[0] } };
+      } else if (lc.includes('top') && lc.includes('token')) {
+        const limitMatch = cleanedText.match(/top\s+(\d{1,3})/i);
+        command = { action: 'top_tokens', params: { limit: limitMatch ? parseInt(limitMatch[1], 10) : 10 } };
+      }
+    }
     if (!command) {
       logger.info('No valid command found in tweet');
       // Fallback: ask AI to provide a helpful conversational reply and share it
@@ -113,6 +143,80 @@ async function handleTweet(tweet, processedTweetIds) {
 
     // Execute the command
     switch (command.action) {
+      case 'available_periods': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Rewards are not configured on this bot right now.`);
+            break;
+          }
+          const claimable = await rewardService.getClaimableRewards(tweet.author_id);
+          if (!claimable.length) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} No claimable reward periods found right now.`);
+            break;
+          }
+          const periods = [...new Set(claimable.map(r => r.periodId))].sort((a, b) => b - a);
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} Claimable periods: ${periods.join(', ')}`);
+        } catch (error) {
+          logger.error('Error handling available_periods in tweet:', error);
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} Sorry, I couldn't fetch available periods. ${error.message}`);
+        }
+        break;
+      }
+
+      case 'check_rewards': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Rewards are not configured on this bot right now.`);
+            break;
+          }
+          const claimable = await rewardService.getClaimableRewards(tweet.author_id);
+          if (!claimable.length) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} You have no claimable rewards right now.`);
+            break;
+          }
+          const lines = claimable
+            .sort((a, b) => b.periodId - a.periodId)
+            .slice(0, 6)
+            .map(r => `• P${r.periodId} #${r.rank}: ${ethers.formatEther(r.rewardAmount)} METIS`);
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} Claimable rewards:\n${lines.join('\n')}`);
+        } catch (error) {
+          logger.error('Error handling check_rewards in tweet:', error);
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} Sorry, I couldn't check rewards. ${error.message}`);
+        }
+        break;
+      }
+
+      case 'claim_reward': {
+        try {
+          const rewardService = getRewardService();
+          if (!rewardService) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Rewards are not configured on this bot right now.`);
+            break;
+          }
+          const requestedPeriodId = command?.params?.periodId;
+          let periodId = requestedPeriodId !== undefined && requestedPeriodId !== null ? Number(requestedPeriodId) : null;
+
+          if (periodId === null || Number.isNaN(periodId)) {
+            const claimable = await rewardService.getClaimableRewards(tweet.author_id);
+            if (!claimable.length) {
+              await twitterService.replyToTweet(tweet.id, `@${authorUsername} You have no claimable rewards right now.`);
+              break;
+            }
+            periodId = claimable.sort((a, b) => b.periodId - a.periodId)[0].periodId;
+          }
+
+          const result = await rewardService.claim(periodId, tweet.author_id);
+          const txUrl = `https://hyperion-testnet-explorer.metisdevops.link/tx/${result.txHash}`;
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} Claim submitted for period ${periodId}. TX: ${txUrl}`);
+        } catch (error) {
+          logger.error('Error handling claim_reward in tweet:', error);
+          await twitterService.replyToTweet(tweet.id, `@${authorUsername} ${error.message}`);
+        }
+        break;
+      }
+
       case 'send': {
         // Get sender's wallet
         const senderWallet = await getWalletForUser(tweet.author_id);
@@ -279,11 +383,17 @@ async function handleTweet(tweet, processedTweetIds) {
         }
 
         const balanceInfo = await getEnhancedBalance(wallet.address);
+        // Enhance with USD
+        let usdMsg = '';
+        try {
+          const metisUsd = await priceService.convertMetisToUsd(balanceInfo.metis);
+          usdMsg = ` (~$${metisUsd.toFixed(2)})`;
+        } catch {}
         logger.info('Balance:', { address: wallet.address, metis: balanceInfo.metis, usdt: balanceInfo.usdt });
 
         const balanceMessage = targetUserId === tweet.author_id
-          ? `@${authorUsername} Your balance is ${balanceInfo.formatted}.`
-          : `@${authorUsername} The balance for ${recipientHandle} is ${balanceInfo.formatted}.`;
+          ? `@${authorUsername} Your balance is ${balanceInfo.formatted}${usdMsg}.`
+          : `@${authorUsername} The balance for ${recipientHandle} is ${balanceInfo.formatted}${usdMsg}.`;
 
         await twitterService.replyToTweet(tweet.id, balanceMessage);
         
@@ -450,6 +560,121 @@ async function handleTweet(tweet, processedTweetIds) {
             status: 'error',
             error: error.message
           });
+        }
+        break;
+      }
+      case 'buy': {
+        try {
+          const senderWallet = await getWalletForUser(tweet.author_id);
+          if (!senderWallet) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} You need a wallet to buy. Say "create wallet" to set one up.`);
+            break;
+          }
+          const { tokenAddress, metisAmount, usdAmount } = command.params || {};
+          if (!tokenAddress) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Please provide a token address to buy.`);
+            break;
+          }
+          // Determine ETH/METIS value in wei
+          let metisAmt = metisAmount ? parseFloat(metisAmount) : null;
+          if (!metisAmt && usdAmount) {
+            const metisFromUsd = await priceService.convertUsdToMetis(parseFloat(usdAmount));
+            metisAmt = metisFromUsd;
+          }
+          if (!metisAmt || metisAmt <= 0) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Invalid amount. Example: buy 0xToken... worth of 0.01 METIS or $5`);
+            break;
+          }
+          const ethInWei = ethers.parseEther(String(metisAmt));
+          const result = await gm2HyperionService.buyWithEth({ walletId: senderWallet.id, tokenAddress, ethInWei, slippageBps: 50, twitterUserId: tweet.author_id, username: authorUsername });
+          const txUrl = `https://hyperion-testnet-explorer.metisdevops.link/tx/${result.hash}`;
+          const replyMessage = `@${authorUsername} Buy submitted for ${metisAmt} METIS → ${tokenAddress}. TX: ${txUrl}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'success', action: 'buy' });
+        } catch (error) {
+          const replyMessage = `@${authorUsername} Buy failed: ${error.message}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'error', error: error.message, action: 'buy' });
+        }
+        break;
+      }
+      case 'sell': {
+        try {
+          const senderWallet = await getWalletForUser(tweet.author_id);
+          if (!senderWallet) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} You need a wallet to sell. Say "create wallet" to set one up.`);
+            break;
+          }
+          const { tokenAddress, tokenAmount } = command.params || {};
+          if (!tokenAddress) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Please provide a token address to sell.`);
+            break;
+          }
+          // Determine decimals and balance
+          const decimals = await gm2HyperionService.getTokenDecimals(tokenAddress);
+          let amountUnits;
+          if (tokenAmount && tokenAmount.toString().toLowerCase() === 'all') {
+            const bal = await require('../services/privyUserService').getTokenBalance(senderWallet.address, tokenAddress, decimals);
+            amountUnits = ethers.parseUnits(bal, decimals);
+          } else {
+            amountUnits = ethers.parseUnits(String(tokenAmount || '0'), decimals);
+          }
+          if (amountUnits <= 0n) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Invalid token amount. Example: sell 100000 of 0xToken... or sell all 0xToken...`);
+            break;
+          }
+          const result = await gm2HyperionService.sellTokensForEth({ walletId: senderWallet.id, tokenAddress, tokenAmountUnits: amountUnits, tokenDecimals: decimals, slippageBps: 50, twitterUserId: tweet.author_id, username: authorUsername });
+          const txUrl = `https://hyperion-testnet-explorer.metisdevops.link/tx/${result.hash}`;
+          const replyMessage = `@${authorUsername} Sell submitted for ${tokenAmount} of ${tokenAddress}. TX: ${txUrl}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'success', action: 'sell' });
+        } catch (error) {
+          const replyMessage = `@${authorUsername} Sell failed: ${error.message}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'error', error: error.message, action: 'sell' });
+        }
+        break;
+      }
+      case 'token_info': {
+        try {
+          const { tokenAddress } = command.params || {};
+          if (!tokenAddress) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Provide a token address: token info 0xToken...`);
+            break;
+          }
+          const detail = await gm2ApiService.getTokenDetail(tokenAddress);
+          const t = detail?.data;
+          if (!t) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} Token not found.`);
+            break;
+          }
+          const replyMessage = `@${authorUsername} ${t.tokenName} ($${t.tokenSymbol})\nPrice: $${t.currentPrice}\nFDV: $${t.totalMarketCap}\nTVL: $${t.tvl}\nHolders: ${t.totalHolders}\nAddr: ${t.tokenAddress}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'success', action: 'token_info' });
+        } catch (error) {
+          const replyMessage = `@${authorUsername} Could not fetch token info: ${error.message}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'error', error: error.message, action: 'token_info' });
+        }
+        break;
+      }
+      case 'top_tokens': {
+        try {
+          const limit = (command.params && command.params.limit) ? Number(command.params.limit) : 10;
+          const res = await gm2ApiService.listTokens({ limit, page: 1, sort: 'createdAt:desc' });
+          const arr = res?.data || [];
+          if (!arr.length) {
+            await twitterService.replyToTweet(tweet.id, `@${authorUsername} No tokens found.`);
+            break;
+          }
+          const lines = arr.slice(0, limit).map((t, i) => `${i+1}. ${t.tokenName} ($${t.tokenSymbol}) mc:$${t.totalMarketCap}\n   Contract: ${t.tokenAddress}`);
+          const replyMessage = `@${authorUsername} Top ${Math.min(limit, arr.length)} tokens:\n` + lines.join('\n');
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'success', action: 'top_tokens' });
+        } catch (error) {
+          const replyMessage = `@${authorUsername} Could not fetch top tokens: ${error.message}`;
+          await twitterService.replyToTweet(tweet.id, replyMessage);
+          await addTweetReplyToHistory(tweet.author_id, { tweetId: tweet.id, tweetText: tweet.text, replyId: null, replyText: replyMessage, createdAt: new Date(tweet.created_at), repliedAt: new Date(), status: 'error', error: error.message, action: 'top_tokens' });
         }
         break;
       }

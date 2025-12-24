@@ -1,4 +1,6 @@
 const { TwitterApi } = require('twitter-api-v2');
+const { TwitterApiRateLimitPlugin } = require('@twitter-api-v2/plugin-rate-limit');
+
 const { setupLogger } = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
@@ -15,12 +17,16 @@ class TwitterService {
       throw new Error('TWITTER_USERNAME is not set in environment variables');
     }
 
+    // Create the rate limiting plugin
+    const rateLimitPlugin = new TwitterApiRateLimitPlugin();
+    
     this.client = new TwitterApi({
       appKey: process.env.TWITTER_API_KEY,
       appSecret: process.env.TWITTER_API_SECRET,
       accessToken: process.env.TWITTER_ACCESS_TOKEN,
       accessSecret: process.env.TWITTER_ACCESS_SECRET,
-    });
+    }, undefined, undefined, { plugins: [rateLimitPlugin] });
+    
     this.username = process.env.TWITTER_USERNAME;
     this.userId = process.env.BOT_USER_ID || null; // Use env if available
 
@@ -38,19 +44,35 @@ class TwitterService {
   async getMentions(sinceTimestamp = null) {
     // If MOCK_TWITTER is set, load from mock_mentions.json
     if (process.env.MOCK_TWITTER === '1') {
-      const mockPath = path.join(__dirname, '../../mock_mentions.json');
-      if (fs.existsSync(mockPath)) {
-        const data = fs.readFileSync(mockPath, 'utf8');
-        try {
-          const tweets = JSON.parse(data);
-          logger.info('Loaded mentions from mock_mentions.json', { count: tweets.length });
-          return tweets;
-        } catch (e) {
-          logger.error('Failed to parse mock_mentions.json', { error: e.message });
-          return [];
+      const candidates = [
+        path.join(__dirname, '../../mock_mentions.json'),
+        path.join(__dirname, '../../json/mock_mentions.json'),
+      ];
+      const mockPath = candidates.find((p) => fs.existsSync(p));
+      if (!mockPath) {
+        logger.warn('mock_mentions.json not found (tried root + json/), returning empty list');
+        return [];
+      }
+      const data = fs.readFileSync(mockPath, 'utf8');
+      try {
+        let tweets = JSON.parse(data);
+        if (!Array.isArray(tweets)) tweets = [];
+
+        // Mimic Twitter API start_time behavior so cursor logic can be tested locally.
+        if (sinceTimestamp) {
+          const sinceMs = new Date(sinceTimestamp).getTime();
+          if (Number.isFinite(sinceMs)) {
+            tweets = tweets.filter((t) => {
+              const createdMs = new Date(t.created_at).getTime();
+              return Number.isFinite(createdMs) && createdMs > sinceMs;
+            });
+          }
         }
-      } else {
-        logger.warn('mock_mentions.json not found, returning empty list');
+
+        logger.info('Loaded mentions from mock_mentions.json', { path: mockPath, count: tweets.length, sinceTimestamp });
+        return tweets;
+      } catch (e) {
+        logger.error('Failed to parse mock_mentions.json', { error: e.message });
         return [];
       }
     }

@@ -11,6 +11,8 @@ const SwapTransactionSchema = new mongoose.Schema({
   walletAddress: { type: String, required: true },
   fromToken: { type: String, required: true }, // METIS, USDT, etc.
   toToken: { type: String, required: true }, // METIS, USDT, etc.
+  tokenAddress: { type: String }, // For GM2 meme token address when applicable
+  protocol: { type: String }, // e.g., 'SUSHI_ROUTER', 'GM2_BOND'
   amountIn: { type: String, required: true }, // String to handle decimal precision
   amountOut: { type: String }, // Output amount (may not be known initially)
   amountOutMin: { type: String }, // Minimum output amount for slippage protection

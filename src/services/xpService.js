@@ -46,11 +46,45 @@ const DailyActivitySchema = new mongoose.Schema({
   dailyBonus: { type: Number, default: 0 }
 });
 
+// Reward snapshot state schema - tracks last processed period for snapshotting
+const RewardSnapshotStateSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true },
+  lastSnapshottedPeriodId: { type: Number, default: -1 },
+  // Updated whenever the bot checks whether a snapshot is needed.
+  lastCheckedAt: { type: Date },
+  // Best-effort next scheduled check time (based on SNAPSHOT_CHECK_INTERVAL at runtime).
+  nextCheckAt: { type: Date },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+// Period Reward Snapshot Schema - stores end-of-period leaderboard results and rewards
+const PeriodRewardSnapshotSchema = new mongoose.Schema({
+  periodId: { type: Number, required: true, index: true },
+  periodDuration: { type: Number, required: true }, // seconds
+  periodStart: { type: Date, required: true },
+  periodEnd: { type: Date, required: true },
+  userId: { type: String, required: true, index: true },
+  username: { type: String, required: true },
+  rank: { type: Number, required: true },
+  totalXP: { type: Number, required: true },
+  rewardAmount: { type: String, required: true }, // wei string
+  tokenAddress: { type: String, required: true }, // address(0) for native
+  claimed: { type: Boolean, default: false },
+  claimedAt: { type: Date },
+  txHash: { type: String },
+  snapshotDate: { type: Date, default: Date.now }
+});
+
+// Uniqueness: one snapshot row per user per period
+PeriodRewardSnapshotSchema.index({ periodId: 1, userId: 1 }, { unique: true });
+
 // Create models
 const XPTransaction = mongoose.model('XPTransaction', XPTransactionSchema);
 const UserXP = mongoose.model('UserXP', UserXPSchema);
 const Leaderboard = mongoose.model('Leaderboard', LeaderboardSchema);
 const DailyActivity = mongoose.model('DailyActivity', DailyActivitySchema);
+const RewardSnapshotState = mongoose.model('RewardSnapshotState', RewardSnapshotStateSchema);
+const PeriodRewardSnapshot = mongoose.model('PeriodRewardSnapshot', PeriodRewardSnapshotSchema);
 
 // XP Reward Structure
 const XP_REWARDS = {
@@ -85,8 +119,80 @@ class XPService {
       await Leaderboard.collection.createIndex({ totalXP: -1, rank: 1 });
       await XPTransaction.collection.createIndex({ userId: 1, timestamp: -1 });
       await DailyActivity.collection.createIndex({ userId: 1, date: -1 });
+      
+      // Try to create unique index for WALLET_CREATION, clean up duplicates if needed
+      try {
+        await XPTransaction.collection.createIndex(
+          { userId: 1, action: 1 },
+          { unique: true, partialFilterExpression: { action: 'WALLET_CREATION' } }
+        );
+        logger.info('Successfully created unique index for WALLET_CREATION');
+      } catch (indexError) {
+        if (indexError.code === 11000) {
+          logger.warn('Duplicate key error when creating WALLET_CREATION index. Cleaning up duplicates...');
+          await this.cleanupDuplicateWalletCreation();
+          
+          // Try creating the index again
+          await XPTransaction.collection.createIndex(
+            { userId: 1, action: 1 },
+            { unique: true, partialFilterExpression: { action: 'WALLET_CREATION' } }
+          );
+          logger.info('Successfully created unique index for WALLET_CREATION after cleanup');
+        } else {
+          throw indexError;
+        }
+      }
     } catch (error) {
       logger.error('Error setting up XP indexes:', error);
+    }
+  }
+
+  // Clean up duplicate WALLET_CREATION transactions
+  async cleanupDuplicateWalletCreation() {
+    try {
+      const db = mongoose.connection.db;
+      const collection = db.collection('xptransactions');
+      
+      // Find all WALLET_CREATION transactions
+      const walletCreations = await collection.find({ action: 'WALLET_CREATION' }).toArray();
+      
+      // Group by userId to find duplicates
+      const userGroups = {};
+      walletCreations.forEach(transaction => {
+        if (!userGroups[transaction.userId]) {
+          userGroups[transaction.userId] = [];
+        }
+        userGroups[transaction.userId].push(transaction);
+      });
+      
+      // Process duplicates
+      let totalRemoved = 0;
+      for (const [userId, transactions] of Object.entries(userGroups)) {
+        if (transactions.length > 1) {
+          logger.info(`User ${userId} has ${transactions.length} WALLET_CREATION transactions`);
+          
+          // Keep the first one (oldest timestamp), remove the rest
+          const sortedTransactions = transactions.sort((a, b) => 
+            new Date(a.timestamp) - new Date(b.timestamp)
+          );
+          
+          const toRemove = sortedTransactions.slice(1);
+          const idsToRemove = toRemove.map(t => t._id);
+          
+          if (idsToRemove.length > 0) {
+            const result = await collection.deleteMany({ _id: { $in: idsToRemove } });
+            logger.info(`Removed ${result.deletedCount} duplicate transactions for user ${userId}`);
+            totalRemoved += result.deletedCount;
+          }
+        }
+      }
+      
+      logger.info(`Total duplicate transactions removed: ${totalRemoved}`);
+      return totalRemoved;
+      
+    } catch (error) {
+      logger.error('Error cleaning up duplicates:', error);
+      throw error;
     }
   }
 
@@ -442,6 +548,17 @@ class XPService {
   }
 
   async awardForWalletCreation(userId, username) {
+    // Idempotency: award wallet creation XP only once per user
+    try {
+      const existing = await XPTransaction.findOne({ userId, action: 'WALLET_CREATION' }).lean();
+      if (existing) {
+        logger.info(`User ${username} already received wallet creation XP - no additional XP awarded`);
+        return 0;
+      }
+    } catch (checkError) {
+      logger.error('Error checking existing WALLET_CREATION XP transaction:', checkError);
+      // Proceeding without awarding duplicate XP if check fails is safer; fall through to attempt award
+    }
     return this.awardXP(userId, username, 'WALLET_CREATION');
   }
 
@@ -464,6 +581,8 @@ module.exports = {
   UserXP,
   Leaderboard,
   DailyActivity,
+  RewardSnapshotState,
+  PeriodRewardSnapshot,
   XP_REWARDS,
   LEVEL_THRESHOLDS
 };
